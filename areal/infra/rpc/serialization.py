@@ -452,6 +452,15 @@ def serialize_value(value: Any) -> Any:
     return value
 
 
+def serialize_values(values: list[Any]) -> list[Any]:
+    """Serialize a list of values while preserving order.
+
+    This helper is used by batch-oriented RPC data paths so the batching
+    logic stays out of transport handlers.
+    """
+    return [serialize_value(value) for value in values]
+
+
 def deserialize_value(value: Any) -> Any:
     """Recursively deserialize a value, converting SerializedTensor and SerializedDataclass dicts back.
 
@@ -536,3 +545,8 @@ def deserialize_value(value: Any) -> Any:
 
     # Primitives pass through unchanged
     return value
+
+
+def deserialize_values(values: list[Any]) -> list[Any]:
+    """Deserialize a list of values while preserving order."""
+    return [deserialize_value(value) for value in values]

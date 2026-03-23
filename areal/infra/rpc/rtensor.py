@@ -79,6 +79,11 @@ class TensorShardInfo:
 
 
 class HttpRTensorBackend:
+    def __init__(self, max_shards_per_request: int = 32) -> None:
+        if max_shards_per_request <= 0:
+            raise ValueError("max_shards_per_request must be positive")
+        self.max_shards_per_request = max_shards_per_request
+
     async def _fetch_tensor(
         self, session: aiohttp.ClientSession, shard_id: str, node_addr: str
     ) -> torch.Tensor:
@@ -88,10 +93,51 @@ class HttpRTensorBackend:
         url = f"http://{node_addr}/data/{shard_id}"
         async with session.get(url) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Failed to fetch shard from {url}: {resp.status}")
+                error_body = (await resp.text()).strip()
+                detail = f" body={error_body}" if error_body else ""
+                raise RuntimeError(
+                    f"Failed to fetch shard from {url}: {resp.status}{detail}"
+                )
             data_bytes = await resp.read()
             serialized_data = orjson.loads(data_bytes)
             return deserialize_value(serialized_data)
+
+    async def _fetch_shard_group(
+        self,
+        session: aiohttp.ClientSession,
+        node_addr: str,
+        grouped: list[tuple[int, TensorShardInfo]],
+    ) -> list[torch.Tensor]:
+        from areal.infra.rpc.serialization import deserialize_values
+
+        shard_ids = [shard.shard_id for _, shard in grouped]
+        url = f"http://{node_addr}/data/batch"
+        async with session.post(url, json={"shard_ids": shard_ids}) as resp:
+            if resp.status == 404:
+                # Mixed-version compatibility: fall back to the legacy
+                # one-shard-per-request path if batch fetch is unavailable.
+                return await asyncio.gather(
+                    *[
+                        self._fetch_tensor(session, shard.shard_id, node_addr)
+                        for _, shard in grouped
+                    ]
+                )
+
+            if resp.status != 200:
+                error_body = (await resp.text()).strip()
+                detail = f" body={error_body}" if error_body else ""
+                raise RuntimeError(
+                    f"Failed to fetch shard batch from {url}: {resp.status}{detail}"
+                )
+
+            data_bytes = await resp.read()
+            serialized_data = orjson.loads(data_bytes)
+            tensors = deserialize_values(serialized_data)
+            if len(tensors) != len(grouped):
+                raise RuntimeError(
+                    f"Batch fetch from {url} returned {len(tensors)} shards for {len(grouped)} requested"
+                )
+            return tensors
 
     def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
         """Fetch multiple shards concurrently via HTTP using a single session."""
@@ -99,11 +145,40 @@ class HttpRTensorBackend:
             return []
 
         async def _fetch():
+            indexed_shards = list(enumerate(shards))
+            shards_by_node: dict[str, list[tuple[int, TensorShardInfo]]] = defaultdict(list)
+            for index, shard in indexed_shards:
+                shards_by_node[shard.node_addr].append((index, shard))
+
+            results: list[torch.Tensor | None] = [None] * len(shards)
+
             async with aiohttp.ClientSession() as session:
-                tasks = [
-                    self._fetch_tensor(session, s.shard_id, s.node_addr) for s in shards
-                ]
-                return await asyncio.gather(*tasks)
+                async def _fetch_node(
+                    node_addr: str, grouped: list[tuple[int, TensorShardInfo]]
+                ) -> None:
+                    for start in range(0, len(grouped), self.max_shards_per_request):
+                        chunk = grouped[start : start + self.max_shards_per_request]
+                        tensors = await self._fetch_shard_group(session, node_addr, chunk)
+                        for (original_index, _), tensor in zip(chunk, tensors, strict=True):
+                            results[original_index] = tensor
+
+                await asyncio.gather(
+                    *[
+                        _fetch_node(node_addr, grouped)
+                        for node_addr, grouped in shards_by_node.items()
+                    ]
+                )
+
+            missing_indices = [
+                str(index) for index, result in enumerate(results) if result is None
+            ]
+            if missing_indices:
+                raise RuntimeError(
+                    "Incomplete shard fetch results for indices: "
+                    + ", ".join(missing_indices)
+                )
+
+            return [result for result in results if result is not None]
 
         return run_async_task(_fetch)
 
