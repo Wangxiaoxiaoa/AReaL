@@ -143,23 +143,46 @@ def _get_runtime_lora_state(
 ) -> tuple[OrderedDict[str, int], dict[str, tuple[int, str | None]]]:
     """Get mutable runtime LoRA slot state kept on the API server.
 
-    `_areal_runtime_lora_slots` tracks the public versioned route name to adapter id
-    mapping in recency order. `_areal_runtime_lora_pending_slots` keeps temporary
-    reservations while a new adapter version is being loaded so concurrent requests
-    cannot race and allocate the same slot inconsistently.
+    `_areal_runtime_lora_slots` only tracks runtime-managed versioned LoRA routes
+    that may be replaced by newer versions. Static non-versioned adapters still
+    count toward the vLLM LoRA capacity limit, but they are not eviction targets.
+    `_areal_runtime_lora_pending_slots` keeps temporary reservations while a new
+    adapter version is being loaded so concurrent requests cannot race and allocate
+    the same slot inconsistently.
     """
     if not hasattr(app.state, "_areal_runtime_lora_slots"):
         serving_models = getattr(app.state, "openai_serving_models", None)
         loaded = OrderedDict()
         if serving_models is not None:
             for name, request in serving_models.lora_requests.items():
-                loaded[name] = request.lora_int_id
+                _, version = _split_versioned_lora_name(name)
+                if version is not None:
+                    loaded[name] = request.lora_int_id
         app.state._areal_runtime_lora_slots = loaded
         app.state._areal_runtime_lora_pending_slots = {}
     return (
         app.state._areal_runtime_lora_slots,
         app.state._areal_runtime_lora_pending_slots,
     )
+
+
+def _get_occupied_lora_slots(app) -> set[int]:
+    """Return all currently occupied LoRA adapter ids.
+
+    This includes static adapters already registered in vLLM plus pending runtime
+    reservations that have not been finalized yet.
+    """
+    occupied = set()
+    serving_models = getattr(app.state, "openai_serving_models", None)
+    if serving_models is not None:
+        for request in serving_models.lora_requests.values():
+            lora_int_id = getattr(request, "lora_int_id", None)
+            if lora_int_id is not None:
+                occupied.add(int(lora_int_id))
+    _, pending = _get_runtime_lora_state(app)
+    for lora_int_id, _ in pending.values():
+        occupied.add(int(lora_int_id))
+    return occupied
 
 
 def _choose_eviction_candidate(
@@ -196,11 +219,16 @@ def _reserve_runtime_lora_slot(app, lora_name: str) -> tuple[int, str | None]:
         return reservation
 
     capacity = _get_runtime_lora_capacity(app)
-    used_slots = set(slots.values())
+    used_slots = _get_occupied_lora_slots(app)
     free_slots = [slot for slot in range(1, capacity + 1) if slot not in used_slots]
     if free_slots:
         reservation = (free_slots[0], None)
     else:
+        if not slots:
+            raise RuntimeError(
+                "All LoRA slots are occupied by non-runtime adapters; cannot reserve "
+                f"a runtime slot for {lora_name!r}."
+            )
         evicted_name, evicted_slot = _choose_eviction_candidate(slots, lora_name)
         reservation = (evicted_slot, evicted_name)
     pending[lora_name] = reservation

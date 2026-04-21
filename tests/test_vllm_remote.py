@@ -116,6 +116,25 @@ def test_reserve_runtime_lora_slot_prefers_same_base_eviction():
     assert replaced == "demo-lora-v1"
 
 
+def test_reserve_runtime_lora_slot_counts_pending_reservations_as_occupied():
+    app = _make_fake_app(
+        max_loras=3,
+        requests=OrderedDict(
+            {
+                "demo-lora-v1": _make_lora_request("demo-lora-v1", 1),
+            }
+        ),
+    )
+
+    first_slot, first_replaced = _reserve_runtime_lora_slot(app, "demo-lora-v2")
+    second_slot, second_replaced = _reserve_runtime_lora_slot(app, "other-lora-v1")
+
+    assert first_slot == 2
+    assert first_replaced is None
+    assert second_slot == 3
+    assert second_replaced is None
+
+
 def test_choose_eviction_candidate_falls_back_to_oldest_other_base():
     slots = OrderedDict(
         {
@@ -161,3 +180,20 @@ def test_register_runtime_lora_name_replaces_public_route_and_updates_slots():
     assert requests["demo-lora-v2"].base_model_name == "base-model"
     assert list(slots.items()) == [("other-lora-v3", 2), ("demo-lora-v2", 1)]
     assert "demo-lora-v2" not in pending
+
+
+def test_static_non_versioned_lora_is_not_an_eviction_candidate():
+    app = _make_fake_app(
+        max_loras=2,
+        requests=OrderedDict(
+            {
+                "static-ocr": _make_lora_request("static-ocr", 1, "/models/static-ocr"),
+                "demo-lora-v1": _make_lora_request("demo-lora-v1", 2, "xccl://demo-lora-v1"),
+            }
+        ),
+    )
+
+    slot, replaced = _reserve_runtime_lora_slot(app, "demo-lora-v2")
+
+    assert slot == 2
+    assert replaced == "demo-lora-v1"
