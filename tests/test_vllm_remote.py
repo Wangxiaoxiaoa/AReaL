@@ -1,0 +1,163 @@
+from collections import OrderedDict
+from types import SimpleNamespace
+
+from areal.api import WeightUpdateMeta
+from areal.api.io_struct import ParamSpec
+from areal.engine.vllm_ext.areal_vllm_server import (
+    _choose_eviction_candidate,
+    _get_runtime_lora_state,
+    _register_runtime_lora_name,
+    _reserve_runtime_lora_slot,
+)
+from areal.engine.vllm_remote import VLLMBackend
+
+
+def _make_fake_app(*, max_loras=4, requests=None):
+    if requests is None:
+        requests = OrderedDict()
+    serving_models = SimpleNamespace(lora_requests=requests)
+    state = SimpleNamespace(
+        args=SimpleNamespace(max_loras=max_loras),
+        openai_serving_models=serving_models,
+    )
+    return SimpleNamespace(state=state)
+
+
+def _make_lora_request(name: str, adapter_id: int, path: str | None = None):
+    req = SimpleNamespace(
+        lora_name=name,
+        lora_int_id=adapter_id,
+        lora_path=path or f"/tmp/{name}",
+        base_model_name="base-model",
+    )
+    return req
+
+
+def test_build_distributed_lora_weight_update_requests_uses_versioned_name_only():
+    backend = VLLMBackend()
+    meta = WeightUpdateMeta(
+        type="xccl",
+        use_lora=True,
+        lora_name="demo-lora",
+        lora_int_id=1,
+        base_model_name="base-model",
+        peft_config={
+            "target_modules": ["q_proj", "v_proj"],
+            "r": 64,
+            "lora_alpha": 16,
+            "bias": "none",
+        },
+        version=3,
+        nccl_group_name="weight-update",
+    )
+    param_specs = [ParamSpec(name="a", shape=(1,), dtype="float16")]
+
+    requests = backend.build_distributed_weight_update_requests(meta, param_specs)
+
+    meta_req, update_req = requests.requests
+    assert meta_req.payload["lora_name"] == "demo-lora-v3"
+    assert "lora_int_id" not in meta_req.payload
+    assert update_req.payload["lora_name"] == "demo-lora-v3"
+    assert "lora_int_id" not in update_req.payload
+    assert update_req.endpoint == "/areal_update_weights_lora_xccl"
+
+
+def test_build_disk_lora_weight_update_requests_uses_areal_endpoint():
+    backend = VLLMBackend()
+    meta = WeightUpdateMeta(
+        type="disk",
+        path="/tmp/adapter",
+        use_lora=True,
+        lora_name="demo-lora",
+        base_model_name="base-model",
+        version=7,
+    )
+
+    requests = backend.build_disk_weight_update_requests(meta)
+
+    (req,) = requests.requests
+    assert req.endpoint == "/areal_update_weights_lora"
+    assert req.payload == {
+        "lora_model_path": "/tmp/adapter",
+        "lora_name": "demo-lora-v7",
+        "base_model_name": "base-model",
+    }
+
+
+def test_reserve_runtime_lora_slot_reuses_existing_version_slot():
+    app = _make_fake_app(
+        requests=OrderedDict(
+            {
+                "demo-lora-v1": _make_lora_request("demo-lora-v1", 2),
+            }
+        )
+    )
+
+    slot, replaced = _reserve_runtime_lora_slot(app, "demo-lora-v1")
+
+    assert slot == 2
+    assert replaced is None
+
+
+def test_reserve_runtime_lora_slot_prefers_same_base_eviction():
+    app = _make_fake_app(
+        max_loras=2,
+        requests=OrderedDict(
+            {
+                "demo-lora-v1": _make_lora_request("demo-lora-v1", 1),
+                "other-lora-v4": _make_lora_request("other-lora-v4", 2),
+            }
+        ),
+    )
+
+    slot, replaced = _reserve_runtime_lora_slot(app, "demo-lora-v2")
+
+    assert slot == 1
+    assert replaced == "demo-lora-v1"
+
+
+def test_choose_eviction_candidate_falls_back_to_oldest_other_base():
+    slots = OrderedDict(
+        {
+            "first-lora-v1": 3,
+            "second-lora-v1": 4,
+        }
+    )
+
+    name, slot = _choose_eviction_candidate(slots, "third-lora-v9")
+
+    assert name == "first-lora-v1"
+    assert slot == 3
+
+
+def test_register_runtime_lora_name_replaces_public_route_and_updates_slots():
+    requests = OrderedDict(
+        {
+            "demo-lora-v1": _make_lora_request("demo-lora-v1", 1, "xccl://demo-lora-v1"),
+            "other-lora-v3": _make_lora_request(
+                "other-lora-v3", 2, "xccl://other-lora-v3"
+            ),
+        }
+    )
+    app = _make_fake_app(max_loras=2, requests=requests)
+
+    # Simulate a reserved replacement of the old version.
+    slots, pending = _get_runtime_lora_state(app)
+    slots["demo-lora-v1"] = 1
+    slots["other-lora-v3"] = 2
+    pending["demo-lora-v2"] = (1, "demo-lora-v1")
+
+    _register_runtime_lora_name(
+        app,
+        lora_name="demo-lora-v2",
+        lora_int_id=1,
+        base_model_name="base-model",
+        replaced_lora_name="demo-lora-v1",
+    )
+
+    assert "demo-lora-v1" not in requests
+    assert "demo-lora-v2" in requests
+    assert requests["demo-lora-v2"].lora_int_id == 1
+    assert requests["demo-lora-v2"].base_model_name == "base-model"
+    assert list(slots.items()) == [("other-lora-v3", 2), ("demo-lora-v2", 1)]
+    assert "demo-lora-v2" not in pending
