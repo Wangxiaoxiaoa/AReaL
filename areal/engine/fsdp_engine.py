@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import inspect
 import math
 import os
 import time
@@ -135,6 +136,57 @@ from areal.utils.save_load import get_state_dict_from_repo_id_or_path
 if TYPE_CHECKING:
     from areal.api import Scheduler
     from areal.api.cli_args import DPOEngineConfig, PPOActorConfig, PPOCriticConfig
+
+
+def _get_qwen_vl_get_rope_index(model: nn.Module):
+    get_rope_index = getattr(model, "get_rope_index", None)
+    if callable(get_rope_index):
+        return get_rope_index
+
+    inner_model = getattr(model, "model", None)
+    get_rope_index = getattr(inner_model, "get_rope_index", None)
+    if callable(get_rope_index):
+        return get_rope_index
+
+    model_type = type(model).__qualname__
+    inner_type = type(inner_model).__qualname__ if inner_model is not None else None
+    raise AttributeError(
+        "Qwen-VL FSDP training requires get_rope_index on the model or its "
+        f"inner .model, got model={model_type}, inner_model={inner_type}."
+    )
+
+
+def _build_qwen_vl_rope_index_kwargs(
+    get_rope_index: Callable,
+    model_config,
+    input_ids: torch.Tensor,
+    image_grid_thw: torch.Tensor | None,
+    video_grid_thw: torch.Tensor | None,
+    attention_mask: torch.Tensor | None,
+) -> dict[str, Any]:
+    kwargs = dict(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        attention_mask=attention_mask,
+    )
+    parameters = inspect.signature(get_rope_index).parameters
+    if "mm_token_type_ids" not in parameters:
+        return kwargs
+
+    mm_token_type_ids = input_ids.new_zeros(input_ids.shape)
+    image_token_id = getattr(model_config, "image_token_id", None)
+    video_token_id = getattr(model_config, "video_token_id", None)
+    if image_token_id is not None:
+        mm_token_type_ids = mm_token_type_ids.masked_fill(
+            input_ids == image_token_id, 1
+        )
+    if video_token_id is not None:
+        mm_token_type_ids = mm_token_type_ids.masked_fill(
+            input_ids == video_token_id, 2
+        )
+    kwargs["mm_token_type_ids"] = mm_token_type_ids
+    return kwargs
 
 
 @dataclasses.dataclass
@@ -1633,11 +1685,17 @@ class FSDPEngine(TrainEngine):
                 if video_grid_thw_list:
                     video_grid_thw = torch.cat(video_grid_thw_list)
 
-            position_ids, _ = self.model.model.get_rope_index(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                attention_mask=attn_mask,
+            model = self.model.model
+            get_rope_index = _get_qwen_vl_get_rope_index(model)
+            position_ids, _ = get_rope_index(
+                **_build_qwen_vl_rope_index_kwargs(
+                    get_rope_index=get_rope_index,
+                    model_config=model.config,
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attn_mask,
+                )
             )
             position_ids = torch.einsum("ijk->jki", position_ids)
             input_["position_ids"] = position_ids
